@@ -3,19 +3,24 @@ use actix_web::{
     web::{Data, Json, Path},
     App, HttpResponse, HttpServer, Responder,
 };
-use chrono::{DateTime, TimeZone, Timelike, Utc};
+use chrono::{NaiveDateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::{io::Error, sync::Mutex};
+use sqlx::Row;
+use sqlx::{
+    postgres::{PgPool, PgPoolOptions},
+    query,
+};
+use std::io::Error;
 
 #[derive(Serialize, Clone)]
 struct Mind {
     id: u32,
-    publish_time: DateTime<Utc>,
+    publish_time: NaiveDateTime,
     content: String,
 }
 
 struct AppState {
-    minds: Mutex<Vec<Mind>>,
+    db_pool: PgPool,
 }
 
 #[derive(Serialize, Clone)]
@@ -25,9 +30,21 @@ struct GetMindsResponse {
 
 #[get("/minds")]
 async fn get_minds_handler(state: Data<AppState>) -> Result<impl Responder, Error> {
-    Ok(Json(GetMindsResponse {
-        minds: state.minds.lock().unwrap().to_vec(),
-    }))
+    let result = query("SELECT id, publish_time, content FROM minds;")
+        .fetch_all(&state.db_pool)
+        .await
+        .unwrap();
+    let mut minds: Vec<Mind> = vec![];
+
+    for item in result {
+        minds.push(Mind {
+            id: item.get::<i32, _>(0) as u32,
+            publish_time: item.get(1),
+            content: item.get(2),
+        });
+    }
+
+    Ok(Json(GetMindsResponse { minds }))
 }
 
 #[derive(Deserialize)]
@@ -40,17 +57,18 @@ async fn create_mind_handler(
     state: Data<AppState>,
     data: Json<CreateMindHandlerRequest>,
 ) -> Result<impl Responder, Error> {
-    let max_id = match state.minds.lock().unwrap().iter().map(|x| x.id).max() {
-        Some(x) => x,
-        None => 0,
-    };
     let mind = Mind {
-        id: max_id + 1,
-        publish_time: Utc::now().with_nanosecond(0).unwrap(),
+        id: 1,
+        publish_time: Utc::now().naive_utc().with_nanosecond(0).unwrap(),
         content: data.content.clone(),
     };
 
-    state.minds.lock().unwrap().push(mind.clone());
+    query("INSERT INTO minds (publish_time, content) VALUES ($1, $2);")
+        .bind(mind.publish_time)
+        .bind(mind.content.clone())
+        .execute(&state.db_pool)
+        .await
+        .unwrap();
 
     Ok(Json(mind))
 }
@@ -62,7 +80,11 @@ async fn delete_mind_handler(
 ) -> Result<impl Responder, Error> {
     let id = path.into_inner();
 
-    state.minds.lock().unwrap().retain(|x| x.id != id);
+    query("DELETE FROM minds WHERE id = $1")
+        .bind(id as i32)
+        .execute(&state.db_pool)
+        .await
+        .unwrap();
 
     Ok(HttpResponse::NoContent())
 }
@@ -70,23 +92,11 @@ async fn delete_mind_handler(
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let app_state = Data::new(AppState {
-        minds: Mutex::new(vec![
-            Mind {
-                id: 1,
-                publish_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-                content: "This is a test content.".to_string(),
-            },
-            Mind {
-                id: 2,
-                publish_time: Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
-                content: "普普通通的第二段测试内容。".to_string(),
-            },
-            Mind {
-                id: 3,
-                publish_time: Utc.with_ymd_and_hms(2024, 10, 31, 23, 59, 59).unwrap(),
-                content: "写点什么好呢？".to_string(),
-            },
-        ]),
+        db_pool: PgPoolOptions::new()
+            .max_connections(3)
+            .connect("postgres://mindbox:mindbox@localhost:5432/mindbox")
+            .await
+            .unwrap(),
     });
 
     HttpServer::new(move || {
